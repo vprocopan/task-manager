@@ -1,0 +1,18 @@
+version: "3.9"
+
+services:
+  task-manager:
+    build:
+      context: .
+      dockerfile: Containerfile
+    container_name: task-manager
+    ports:
+      - "8000:8000"
+    volumes:
+      - task-data:/data
+    environment:
+      - APP_PORT=8000
+      - TASK_DB_PATH=/data/tasks.db
+
+volumes:
+  task-data:
