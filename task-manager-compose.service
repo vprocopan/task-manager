@@ -1,0 +1,15 @@
+[Unit]
+Description=Task Manager stack (podman-compose)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/home/vprocopan/Documents/task-manager
+ExecStart=/usr/bin/env podman-compose up -d --build
+ExecStop=/usr/bin/env podman-compose down
+TimeoutStartSec=0
+
+[Install]
+WantedBy=default.target

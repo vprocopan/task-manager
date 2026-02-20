@@ -1,18 +1,32 @@
 version: "3.9"
 
 services:
+  db:
+    image: docker.io/library/postgres:16-alpine
+    container_name: task-manager-db
+    environment:
+      - POSTGRES_DB=tasks
+      - POSTGRES_USER=tasks
+      - POSTGRES_PASSWORD=tasks
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+
   task-manager:
     build:
       context: .
       dockerfile: Containerfile
     container_name: task-manager
+    depends_on:
+      - db
     ports:
       - "8000:8000"
-    volumes:
-      - task-data:/data
     environment:
       - APP_PORT=8000
-      - TASK_DB_PATH=/data/tasks.db
+      - DB_HOST=db
+      - DB_PORT=5432
+      - DB_NAME=tasks
+      - DB_USER=tasks
+      - DB_PASSWORD=tasks
 
 volumes:
-  task-data:
+  pg-data:

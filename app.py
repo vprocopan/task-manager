@@ -1,55 +1,86 @@
 #!/usr/bin/env python3
 import os
-import sqlite3
-from datetime import datetime
+import time
+from datetime import datetime, timezone
 from html import escape
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-DB_PATH = os.environ.get("TASK_DB_PATH", "/data/tasks.db")
+import psycopg
+from psycopg.rows import dict_row
+
+DB_DSN = os.environ.get("DATABASE_URL")
+DB_HOST = os.environ.get("DB_HOST", "db")
+DB_PORT = int(os.environ.get("DB_PORT", "5432"))
+DB_NAME = os.environ.get("DB_NAME", "tasks")
+DB_USER = os.environ.get("DB_USER", "tasks")
+DB_PASSWORD = os.environ.get("DB_PASSWORD", "tasks")
+DB_CONNECT_RETRIES = int(os.environ.get("DB_CONNECT_RETRIES", "30"))
+DB_CONNECT_DELAY_SEC = float(os.environ.get("DB_CONNECT_DELAY_SEC", "1"))
 HOST = os.environ.get("APP_HOST", "0.0.0.0")
 PORT = int(os.environ.get("APP_PORT", "8000"))
 
 
+def _connection_dsn():
+    if DB_DSN:
+        return DB_DSN
+    return (
+        f"host={DB_HOST} port={DB_PORT} dbname={DB_NAME} "
+        f"user={DB_USER} password={DB_PASSWORD}"
+    )
+
+
 def get_connection():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    return psycopg.connect(_connection_dsn(), row_factory=dict_row)
 
 
 def init_db():
-    db_dir = os.path.dirname(DB_PATH)
-    if db_dir:
-        os.makedirs(db_dir, exist_ok=True)
+    last_error = None
 
-    with get_connection() as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS tasks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT NOT NULL,
-                completed INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL
+    for attempt in range(1, DB_CONNECT_RETRIES + 1):
+        try:
+            with get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS tasks (
+                            id BIGSERIAL PRIMARY KEY,
+                            title TEXT NOT NULL,
+                            completed BOOLEAN NOT NULL DEFAULT FALSE,
+                            created_at TEXT NOT NULL
+                        )
+                        """
+                    )
+                conn.commit()
+            return
+        except psycopg.OperationalError as exc:
+            last_error = exc
+            if attempt == DB_CONNECT_RETRIES:
+                break
+            print(
+                f"Database not ready yet "
+                f"({attempt}/{DB_CONNECT_RETRIES}), retrying..."
             )
-            """
-        )
-        conn.commit()
+            time.sleep(DB_CONNECT_DELAY_SEC)
+
+    raise RuntimeError("Could not connect to PostgreSQL") from last_error
 
 
 def list_tasks(status_filter="all"):
     query = "SELECT id, title, completed, created_at FROM tasks"
-    params = ()
 
     if status_filter == "active":
-        query += " WHERE completed = 0"
+        query += " WHERE completed = FALSE"
     elif status_filter == "done":
-        query += " WHERE completed = 1"
+        query += " WHERE completed = TRUE"
 
     query += " ORDER BY id DESC"
 
     with get_connection() as conn:
-        rows = conn.execute(query, params).fetchall()
+        with conn.cursor() as cur:
+            cur.execute(query)
+            rows = cur.fetchall()
     return rows
 
 
@@ -58,39 +89,44 @@ def add_task(title):
     if not clean:
         return
 
-    now = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    now = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace(
+        "+00:00", "Z"
+    )
     with get_connection() as conn:
-        conn.execute(
-            "INSERT INTO tasks (title, completed, created_at) VALUES (?, 0, ?)",
-            (clean, now),
-        )
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO tasks (title, completed, created_at) VALUES (%s, FALSE, %s)",
+                (clean, now),
+            )
         conn.commit()
 
 
 def toggle_task(task_id):
     with get_connection() as conn:
-        conn.execute(
-            """
-            UPDATE tasks
-            SET completed = CASE WHEN completed = 1 THEN 0 ELSE 1 END
-            WHERE id = ?
-            """,
-            (task_id,),
-        )
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE tasks
+                SET completed = NOT completed
+                WHERE id = %s
+                """,
+                (task_id,),
+            )
         conn.commit()
 
 
 def delete_task(task_id):
     with get_connection() as conn:
-        conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM tasks WHERE id = %s", (task_id,))
         conn.commit()
 
 
 def render_page(tasks, status_filter):
     counts = {
         "all": len(tasks),
-        "active": sum(1 for t in tasks if t["completed"] == 0),
-        "done": sum(1 for t in tasks if t["completed"] == 1),
+        "active": sum(1 for t in tasks if not t["completed"]),
+        "done": sum(1 for t in tasks if t["completed"]),
     }
 
     filter_options = [
@@ -108,8 +144,9 @@ def render_page(tasks, status_filter):
 
     rows = []
     for task in tasks:
-        checked = "checked" if task["completed"] else ""
-        state_cls = "done" if task["completed"] else "todo"
+        is_done = bool(task["completed"])
+        checked = "checked" if is_done else ""
+        state_cls = "done" if is_done else "todo"
         rows.append(
             """
             <li class="task {state_cls}">
